@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <unistd.h>
 
 typedef struct {
     char *id;
@@ -22,18 +23,62 @@ typedef struct {
 } agent_callback_ctx_t;
 
 typedef struct {
+    pi_agent_t *agent;
     pi_agent_tool_t *atool;
     const char *id;
+    const char *name;
     const char *args_json;
-    void *agent_user_data;
     pi_agent_tool_result_t result;
 } tool_thread_arg_t;
 
+static pi_agent_tool_result_t create_error_result(const char *msg) {
+    pi_agent_tool_result_t res = {0};
+    res.content = cJSON_CreateObject();
+    cJSON_AddStringToObject(res.content, "error", msg);
+    res.is_error = true;
+    return res;
+}
+
+static pi_agent_tool_result_t execute_single_tool(pi_agent_t *agent, pi_agent_tool_t *atool, const char *id, const char *name, const char *args_json) {
+    cJSON *args = cJSON_Parse(args_json);
+    pi_agent_hook_context_t hook_ctx = {id, name, args, agent->user_data};
+    pi_agent_tool_result_t result;
+
+    // Before hook
+    if (agent->before_tool_call) {
+        pi_agent_before_tool_call_result_t before = agent->before_tool_call(&hook_ctx);
+        if (before.block) {
+            result = create_error_result(before.reason ? before.reason : "Blocked by hook");
+            cJSON_Delete(args);
+            return result;
+        }
+    }
+
+    if (atool) {
+        result = atool->proc(id, args, agent->user_data);
+    } else {
+        result = create_error_result("Tool not found");
+    }
+
+    // After hook
+    if (agent->after_tool_call) {
+        pi_agent_after_tool_call_result_t after = agent->after_tool_call(&hook_ctx, result);
+        if (after.content_override) {
+            cJSON_Delete(result.content);
+            result.content = after.content_override;
+        }
+        if (after.use_is_error_override) {
+            result.is_error = after.is_error_override;
+        }
+    }
+
+    cJSON_Delete(args);
+    return result;
+}
+
 static void* tool_thread_func(void *arg) {
     tool_thread_arg_t *targ = (tool_thread_arg_t *)arg;
-    cJSON *args = cJSON_Parse(targ->args_json);
-    targ->result = targ->atool->proc(targ->id, args, targ->agent_user_data);
-    cJSON_Delete(args);
+    targ->result = execute_single_tool(targ->agent, targ->atool, targ->id, targ->name, targ->args_json);
     return NULL;
 }
 
@@ -95,9 +140,19 @@ int pi_agent_run(pi_agent_t *agent, const char *user_prompt, pi_ai_callback_t ca
         tool_call_queue_t queue = {0};
         agent_callback_ctx_t ctx = {callback, agent->user_data, &queue};
 
-        int res = pi_ai_openai_stream(&agent->options, &agent->context, agent_internal_callback, &ctx);
-        if (res != 0) return res;
+        int res = -1;
+        int retries = 0;
+        do {
+            res = pi_ai_openai_stream(&agent->options, &agent->context, agent_internal_callback, &ctx);
+            if (res != 0 && retries < agent->max_retries_on_error) {
+                retries++;
+                if (agent->retry_delay_ms > 0) usleep(agent->retry_delay_ms * 1000);
+                continue;
+            }
+            break;
+        } while (1);
 
+        if (res != 0) return res;
         if (queue.count == 0) break;
 
         if (agent->tool_execution_mode == PI_AGENT_TOOL_EXECUTION_PARALLEL) {
@@ -105,48 +160,29 @@ int pi_agent_run(pi_agent_t *agent, const char *user_prompt, pi_ai_callback_t ca
             tool_thread_arg_t *args = malloc(sizeof(tool_thread_arg_t) * queue.count);
 
             for (size_t i = 0; i < queue.count; i++) {
+                args[i].agent = agent;
                 args[i].atool = find_agent_tool(agent, queue.calls[i].name);
                 args[i].id = queue.calls[i].id;
+                args[i].name = queue.calls[i].name;
                 args[i].args_json = queue.calls[i].args;
-                args[i].agent_user_data = agent->user_data;
-
-                if (args[i].atool) {
-                    pthread_create(&threads[i], NULL, tool_thread_func, &args[i]);
-                }
+                pthread_create(&threads[i], NULL, tool_thread_func, &args[i]);
             }
 
             for (size_t i = 0; i < queue.count; i++) {
-                if (args[i].atool) {
-                    pthread_join(threads[i], NULL);
-                } else {
-                    args[i].result.is_error = true;
-                    args[i].result.content = cJSON_CreateString("Tool not found");
-                    args[i].result.details = NULL;
-                }
+                pthread_join(threads[i], NULL);
                 append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, args[i].result);
             }
 
             free(threads);
             free(args);
         } else {
-            // Sequential
             for (size_t i = 0; i < queue.count; i++) {
                 pi_agent_tool_t *atool = find_agent_tool(agent, queue.calls[i].name);
-                pi_agent_tool_result_t result;
-                if (atool) {
-                    cJSON *args = cJSON_Parse(queue.calls[i].args);
-                    result = atool->proc(queue.calls[i].id, args, agent->user_data);
-                    cJSON_Delete(args);
-                } else {
-                    result.is_error = true;
-                    result.content = cJSON_CreateString("Tool not found");
-                    result.details = NULL;
-                }
+                pi_agent_tool_result_t result = execute_single_tool(agent, atool, queue.calls[i].id, queue.calls[i].name, queue.calls[i].args);
                 append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, result);
             }
         }
 
-        // Cleanup queue
         for (size_t i = 0; i < queue.count; i++) {
             free(queue.calls[i].id);
             free(queue.calls[i].name);

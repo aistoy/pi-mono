@@ -15,6 +15,28 @@ typedef struct {
     bool is_error;
 } pi_agent_tool_result_t;
 
+typedef struct {
+    bool block;
+    char *reason;
+} pi_agent_before_tool_call_result_t;
+
+typedef struct {
+    cJSON *content_override;
+    bool is_error_override;
+    bool use_is_error_override;
+} pi_agent_after_tool_call_result_t;
+
+/** Context for hooks */
+typedef struct {
+    const char *tool_call_id;
+    const char *tool_name;
+    const cJSON *arguments;
+    void *user_data;
+} pi_agent_hook_context_t;
+
+typedef pi_agent_before_tool_call_result_t (*pi_agent_before_tool_call_t)(pi_agent_hook_context_t *ctx);
+typedef pi_agent_after_tool_call_result_t (*pi_agent_after_tool_call_t)(pi_agent_hook_context_t *ctx, pi_agent_tool_result_t result);
+
 /**
  * Tool execution function pointer.
  * Should return a pi_agent_tool_result_t.
@@ -41,6 +63,15 @@ typedef struct {
     pi_agent_tool_t *agent_tools;
     size_t agent_tool_count;
     pi_agent_tool_execution_mode_t tool_execution_mode;
+
+    // Hooks
+    pi_agent_before_tool_call_t before_tool_call;
+    pi_agent_after_tool_call_t after_tool_call;
+
+    // Retry configuration
+    int max_retries_on_error;
+    int retry_delay_ms;
+
     int max_iterations;
     void *user_data;
 } pi_agent_t;

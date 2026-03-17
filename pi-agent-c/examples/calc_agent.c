@@ -5,29 +5,35 @@
 #include <unistd.h>
 #include <time.h>
 
-// Tool: Add with delay to test parallelism
+// Hook: Log tool calls
+pi_agent_before_tool_call_result_t my_before_hook(pi_agent_hook_context_t *ctx) {
+    printf("\n>>> [Hook] Preparing to call %s with args: %s\n", ctx->tool_name, cJSON_PrintUnformatted(ctx->arguments));
+
+    pi_agent_before_tool_call_result_t res = {false, NULL};
+    // Example: Block a specific tool call
+    if (strcmp(ctx->tool_name, "forbidden_tool") == 0) {
+        res.block = true;
+        res.reason = strdup("This tool is not allowed by policy.");
+    }
+    return res;
+}
+
+// Hook: Modify tool results
+pi_agent_after_tool_call_result_t my_after_hook(pi_agent_hook_context_t *ctx, pi_agent_tool_result_t result) {
+    printf(">>> [Hook] %s finished. Original error state: %s\n", ctx->tool_name, result.is_error ? "true" : "false");
+
+    pi_agent_after_tool_call_result_t res = {NULL, false, false};
+    // Example: If result contains a certain value, mark it as error
+    return res;
+}
+
+// Tool: Add
 pi_agent_tool_result_t tool_add(const char *id, const cJSON *args, void *user_data) {
     cJSON *a = cJSON_GetObjectItem(args, "a");
     cJSON *b = cJSON_GetObjectItem(args, "b");
     double res = (a ? a->valuedouble : 0) + (b ? b->valuedouble : 0);
 
-    printf("[Tool Add] Working on %f + %f...\n", (a?a->valuedouble:0), (b?b->valuedouble:0));
-    sleep(2); // Simulate long task
-
-    pi_agent_tool_result_t result = {0};
-    result.content = cJSON_CreateObject();
-    cJSON_AddNumberToObject(result.content, "result", res);
-    return result;
-}
-
-// Tool: Multiply
-pi_agent_tool_result_t tool_multiply(const char *id, const cJSON *args, void *user_data) {
-    cJSON *a = cJSON_GetObjectItem(args, "a");
-    cJSON *b = cJSON_GetObjectItem(args, "b");
-    double res = (a ? a->valuedouble : 0) * (b ? b->valuedouble : 0);
-
-    printf("[Tool Multiply] Working on %f * %f...\n", (a?a->valuedouble:0), (b?b->valuedouble:0));
-    sleep(2);
+    printf("[Tool Add] %f + %f = %f\n", (a?a->valuedouble:0), (b?b->valuedouble:0), res);
 
     pi_agent_tool_result_t result = {0};
     result.content = cJSON_CreateObject();
@@ -39,8 +45,6 @@ void agent_event_callback(pi_ai_event_t *event, void *user_data) {
     if (event->type == PI_AI_EVENT_TEXT_DELTA) {
         printf("%s", event->delta);
         fflush(stdout);
-    } else if (event->type == PI_AI_EVENT_TOOLCALL_START) {
-        printf("\n[Agent calling tool: %s...]\n", event->tool_call_name);
     }
 }
 
@@ -60,19 +64,20 @@ int main() {
     };
 
     pi_agent_t *agent = pi_agent_create(&options);
-    agent->tool_execution_mode = PI_AGENT_TOOL_EXECUTION_PARALLEL;
+
+    // Set hooks
+    agent->before_tool_call = my_before_hook;
+    agent->after_tool_call = my_after_hook;
+
+    // Set retry
+    agent->max_retries_on_error = 2;
+    agent->retry_delay_ms = 1000;
 
     const char *math_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"},\"b\":{\"type\":\"number\"}},\"required\":[\"a\",\"b\"]}";
     pi_agent_register_tool(agent, "add", "Add two numbers", math_schema, tool_add);
-    pi_agent_register_tool(agent, "multiply", "Multiply two numbers", math_schema, tool_multiply);
 
-    printf("Agent ready (Parallel Mode). Prompt: 'Give me the results of 1+1, 2+2, and 3+3.'\n");
-    time_t start = time(NULL);
-    pi_agent_run(agent, "Give me the results of 1+1, 2+2, and 3+3 simultaneously.", agent_event_callback);
-    time_t end = time(NULL);
-
-    printf("\nTotal time taken: %ld seconds\n", (long)(end - start));
-    printf("(If parallel, it should be ~2 seconds. If sequential, it should be ~6 seconds.)\n");
+    printf("Agent ready with Hooks and Retry. Prompt: '123 + 456'\n");
+    pi_agent_run(agent, "What is 123 + 456?", agent_event_callback);
 
     pi_agent_free(agent);
     return 0;
