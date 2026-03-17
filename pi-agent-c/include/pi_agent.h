@@ -4,6 +4,7 @@
 #include "pi_ai.h"
 #include "pi_ai_openai.h"
 #include <cJSON.h>
+#include <pthread.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +58,17 @@ typedef enum {
     PI_AGENT_TOOL_EXECUTION_PARALLEL
 } pi_agent_tool_execution_mode_t;
 
+typedef struct pi_agent_msg_node {
+    pi_ai_message_t *message;
+    struct pi_agent_msg_node *next;
+} pi_agent_msg_node_t;
+
+typedef struct {
+    pi_agent_msg_node_t *head;
+    pi_agent_msg_node_t *tail;
+    size_t count;
+} pi_agent_msg_queue_t;
+
 typedef struct {
     pi_ai_context_t context;
     pi_ai_openai_options_t options;
@@ -72,6 +84,12 @@ typedef struct {
     int max_retries_on_error;
     int retry_delay_ms;
 
+    // Async features
+    pthread_mutex_t mutex;
+    pi_agent_msg_queue_t steering_queue;
+    pi_agent_msg_queue_t follow_up_queue;
+    bool abort_requested;
+
     int max_iterations;
     void *user_data;
 } pi_agent_t;
@@ -82,6 +100,10 @@ void pi_agent_free(pi_agent_t *agent);
 
 // Tool Registration
 void pi_agent_register_tool(pi_agent_t *agent, const char *name, const char *description, const char *parameters_json, pi_agent_tool_proc_t proc);
+
+// Steering & Follow-up
+void pi_agent_steer(pi_agent_t *agent, const char *text);
+void pi_agent_follow_up(pi_agent_t *agent, const char *text);
 
 // Execution
 int pi_agent_run(pi_agent_t *agent, const char *user_prompt, pi_ai_callback_t callback);

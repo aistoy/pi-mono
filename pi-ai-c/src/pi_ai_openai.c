@@ -13,6 +13,7 @@ typedef struct {
     size_t buffer_len;
 
     // State tracking for partial content
+    bool *abort_signal;
     int current_content_index;
     char *accumulated_text;
     char *accumulated_thinking;
@@ -150,6 +151,10 @@ static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdat
     size_t total_size = size * nmemb;
     openai_stream_ctx_t *ctx = (openai_stream_ctx_t *)userdata;
 
+    if (ctx->abort_signal && *(ctx->abort_signal)) {
+        return 0; // Trigger CURL error
+    }
+
     ctx->buffer = realloc(ctx->buffer, ctx->buffer_len + total_size + 1);
     memcpy(ctx->buffer + ctx->buffer_len, ptr, total_size);
     ctx->buffer_len += total_size;
@@ -245,6 +250,7 @@ int pi_ai_openai_stream(
     openai_stream_ctx_t stream_ctx = {0};
     stream_ctx.callback = callback;
     stream_ctx.user_data = user_data;
+    stream_ctx.abort_signal = options->abort_signal;
 
     curl_easy_setopt(curl, CURLOPT_URL, options->api_base_url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);

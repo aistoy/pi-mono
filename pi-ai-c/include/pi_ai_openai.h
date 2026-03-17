@@ -13,6 +13,7 @@ typedef struct {
     const char *model_id;
     double temperature;
     int max_tokens;
+    bool *abort_signal; // If pointed value is true, current request will abort
 } pi_ai_openai_options_t;
 
 /**

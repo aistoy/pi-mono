@@ -20,6 +20,7 @@ typedef struct {
     pi_ai_callback_t original_callback;
     void *user_data;
     tool_call_queue_t *queue;
+    pi_agent_t *agent;
 } agent_callback_ctx_t;
 
 typedef struct {
@@ -44,7 +45,6 @@ static pi_agent_tool_result_t execute_single_tool(pi_agent_t *agent, pi_agent_to
     pi_agent_hook_context_t hook_ctx = {id, name, args, agent->user_data};
     pi_agent_tool_result_t result;
 
-    // Before hook
     if (agent->before_tool_call) {
         pi_agent_before_tool_call_result_t before = agent->before_tool_call(&hook_ctx);
         if (before.block) {
@@ -60,7 +60,6 @@ static pi_agent_tool_result_t execute_single_tool(pi_agent_t *agent, pi_agent_to
         result = create_error_result("Tool not found");
     }
 
-    // After hook
     if (agent->after_tool_call) {
         pi_agent_after_tool_call_result_t after = agent->after_tool_call(&hook_ctx, result);
         if (after.content_override) {
@@ -108,87 +107,151 @@ static pi_agent_tool_t* find_agent_tool(pi_agent_t *agent, const char *name) {
     return NULL;
 }
 
-static void append_tool_result(pi_agent_t *agent, const char *id, const char *name, pi_agent_tool_result_t result) {
+static void append_msg_to_context(pi_agent_t *agent, pi_ai_message_t *msg) {
     agent->context.messages = realloc(agent->context.messages, sizeof(pi_ai_message_t) * (agent->context.message_count + 1));
-    pi_ai_message_t *tm = &agent->context.messages[agent->context.message_count];
-    memset(tm, 0, sizeof(pi_ai_message_t));
-    tm->role = strdup("toolResult");
-    tm->tool_call_id = strdup(id);
-    tm->tool_name = strdup(name);
-    tm->is_error = result.is_error;
+    pi_ai_message_t *target = &agent->context.messages[agent->context.message_count];
+
+    // Manual deep copy of message to context
+    target->role = strdup(msg->role);
+    target->tool_call_id = msg->tool_call_id ? strdup(msg->tool_call_id) : NULL;
+    target->tool_name = msg->tool_name ? strdup(msg->tool_name) : NULL;
+    target->is_error = msg->is_error;
+    target->content_count = 0;
+    target->contents = NULL;
+
+    for (size_t i = 0; i < msg->content_count; i++) {
+        if (msg->contents[i].type == PI_AI_CONTENT_TEXT) {
+            pi_ai_message_add_text(target, msg->contents[i].data.text);
+        }
+        // ... extend for other types if needed
+    }
+    agent->context.message_count++;
+}
+
+static void consume_queue_to_context(pi_agent_t *agent, pi_agent_msg_queue_t *queue) {
+    pthread_mutex_lock(&agent->mutex);
+    pi_agent_msg_node_t *curr = queue->head;
+    while (curr) {
+        append_msg_to_context(agent, curr->message);
+        pi_agent_msg_node_t *next = curr->next;
+        pi_ai_free_message(curr->message);
+        free(curr->message);
+        free(curr);
+        curr = next;
+    }
+    queue->head = queue->tail = NULL;
+    queue->count = 0;
+    pthread_mutex_unlock(&agent->mutex);
+}
+
+static void append_tool_result(pi_agent_t *agent, const char *id, const char *name, pi_agent_tool_result_t result) {
+    pi_ai_message_t msg = {0};
+    msg.role = "toolResult";
+    msg.tool_call_id = (char*)id;
+    msg.tool_name = (char*)name;
+    msg.is_error = result.is_error;
 
     char *res_str = cJSON_PrintUnformatted(result.content);
-    pi_ai_message_add_text(tm, res_str);
+    pi_ai_message_add_text(&msg, res_str);
+    append_msg_to_context(agent, &msg);
+
     free(res_str);
+    pi_ai_free_content(&msg.contents[0]);
+    free(msg.contents);
     cJSON_Delete(result.content);
     if (result.details) cJSON_Delete(result.details);
-
-    agent->context.message_count++;
 }
 
 int pi_agent_run(pi_agent_t *agent, const char *user_prompt, pi_ai_callback_t callback) {
     if (user_prompt) {
-        agent->context.messages = realloc(agent->context.messages, sizeof(pi_ai_message_t) * (agent->context.message_count + 1));
-        pi_ai_message_t *msg = &agent->context.messages[agent->context.message_count];
-        memset(msg, 0, sizeof(pi_ai_message_t));
-        msg->role = strdup("user");
-        pi_ai_message_add_text(msg, user_prompt);
-        agent->context.message_count++;
+        pi_ai_message_t msg = {0};
+        msg.role = "user";
+        pi_ai_message_add_text(&msg, user_prompt);
+        append_msg_to_context(agent, &msg);
+        pi_ai_free_content(&msg.contents[0]);
+        free(msg.contents);
     }
 
-    for (int iter = 0; iter < agent->max_iterations; iter++) {
-        tool_call_queue_t queue = {0};
-        agent_callback_ctx_t ctx = {callback, agent->user_data, &queue};
+    bool continue_loop = true;
+    while (continue_loop) {
+        for (int iter = 0; iter < agent->max_iterations; iter++) {
+            // [Checkpoint 1] Merge Steering messages
+            consume_queue_to_context(agent, &agent->steering_queue);
+            agent->abort_requested = false;
 
-        int res = -1;
-        int retries = 0;
-        do {
-            res = pi_ai_openai_stream(&agent->options, &agent->context, agent_internal_callback, &ctx);
-            if (res != 0 && retries < agent->max_retries_on_error) {
-                retries++;
-                if (agent->retry_delay_ms > 0) usleep(agent->retry_delay_ms * 1000);
-                continue;
+            tool_call_queue_t queue = {0};
+            agent_callback_ctx_t ctx = {callback, agent->user_data, &queue, agent};
+            agent->options.abort_signal = &agent->abort_requested;
+
+            int res = -1;
+            int retries = 0;
+            do {
+                res = pi_ai_openai_stream(&agent->options, &agent->context, agent_internal_callback, &ctx);
+                if (res != 0 && retries < agent->max_retries_on_error) {
+                    retries++;
+                    if (agent->retry_delay_ms > 0) usleep(agent->retry_delay_ms * 1000);
+                    continue;
+                }
+                break;
+            } while (1);
+
+            if (res != 0) return res;
+            if (queue.count == 0) break;
+
+            // Execute tools with Steering checkpoints
+            if (agent->tool_execution_mode == PI_AGENT_TOOL_EXECUTION_PARALLEL) {
+                pthread_t *threads = malloc(sizeof(pthread_t) * queue.count);
+                tool_thread_arg_t *args = malloc(sizeof(tool_thread_arg_t) * queue.count);
+
+                for (size_t i = 0; i < queue.count; i++) {
+                    args[i].agent = agent;
+                    args[i].atool = find_agent_tool(agent, queue.calls[i].name);
+                    args[i].id = queue.calls[i].id;
+                    args[i].name = queue.calls[i].name;
+                    args[i].args_json = queue.calls[i].args;
+                    pthread_create(&threads[i], NULL, tool_thread_func, &args[i]);
+                }
+
+                for (size_t i = 0; i < queue.count; i++) {
+                    pthread_join(threads[i], NULL);
+                    append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, args[i].result);
+                }
+                free(threads);
+                free(args);
+            } else {
+                for (size_t i = 0; i < queue.count; i++) {
+                    // [Checkpoint 2] Steering check during tool stream
+                    pthread_mutex_lock(&agent->mutex);
+                    if (agent->steering_queue.count > 0) {
+                        pthread_mutex_unlock(&agent->mutex);
+                        break; // Interrupt tool sequence
+                    }
+                    pthread_mutex_unlock(&agent->mutex);
+
+                    pi_agent_tool_t *atool = find_agent_tool(agent, queue.calls[i].name);
+                    pi_agent_tool_result_t result = execute_single_tool(agent, atool, queue.calls[i].id, queue.calls[i].name, queue.calls[i].args);
+                    append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, result);
+                }
             }
-            break;
-        } while (1);
-
-        if (res != 0) return res;
-        if (queue.count == 0) break;
-
-        if (agent->tool_execution_mode == PI_AGENT_TOOL_EXECUTION_PARALLEL) {
-            pthread_t *threads = malloc(sizeof(pthread_t) * queue.count);
-            tool_thread_arg_t *args = malloc(sizeof(tool_thread_arg_t) * queue.count);
 
             for (size_t i = 0; i < queue.count; i++) {
-                args[i].agent = agent;
-                args[i].atool = find_agent_tool(agent, queue.calls[i].name);
-                args[i].id = queue.calls[i].id;
-                args[i].name = queue.calls[i].name;
-                args[i].args_json = queue.calls[i].args;
-                pthread_create(&threads[i], NULL, tool_thread_func, &args[i]);
+                free(queue.calls[i].id);
+                free(queue.calls[i].name);
+                free(queue.calls[i].args);
             }
+            free(queue.calls);
+        }
 
-            for (size_t i = 0; i < queue.count; i++) {
-                pthread_join(threads[i], NULL);
-                append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, args[i].result);
-            }
-
-            free(threads);
-            free(args);
+        // [Checkpoint 3] Check Follow-up Queue
+        pthread_mutex_lock(&agent->mutex);
+        if (agent->follow_up_queue.count > 0) {
+            pthread_mutex_unlock(&agent->mutex);
+            consume_queue_to_context(agent, &agent->follow_up_queue);
+            // Re-enter the max_iterations loop
         } else {
-            for (size_t i = 0; i < queue.count; i++) {
-                pi_agent_tool_t *atool = find_agent_tool(agent, queue.calls[i].name);
-                pi_agent_tool_result_t result = execute_single_tool(agent, atool, queue.calls[i].id, queue.calls[i].name, queue.calls[i].args);
-                append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, result);
-            }
+            pthread_mutex_unlock(&agent->mutex);
+            continue_loop = false;
         }
-
-        for (size_t i = 0; i < queue.count; i++) {
-            free(queue.calls[i].id);
-            free(queue.calls[i].name);
-            free(queue.calls[i].args);
-        }
-        free(queue.calls);
     }
 
     return 0;
