@@ -22,6 +22,7 @@ endif()
 # Library
 file(GLOB_RECURSE LIB_SOURCES src/*.c)
 add_library(pi_ai_c SHARED ${LIB_SOURCES})
+set_target_properties(pi_ai_c PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(pi_ai_c cjson ${CURL_LIBRARIES})
 
 # Example

@@ -29,6 +29,8 @@ static void trigger_event(openai_stream_ctx_t *ctx, pi_ai_event_type_t type, con
     ev.content_index = ctx->current_content_index;
     ev.delta = delta;
     ev.full_content = full;
+    ev.tool_call_id = ctx->current_tool_id;
+    ev.tool_call_name = ctx->current_tool_name;
     ev.raw_event_data = NULL;
     ctx->callback(&ev, ctx->user_data);
 }

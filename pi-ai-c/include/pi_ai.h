@@ -80,6 +80,8 @@ typedef struct {
     size_t content_index;
     const char *delta; // For delta events
     const char *full_content; // For end events
+    const char *tool_call_id;   // Added for Agent Loop
+    const char *tool_call_name; // Added for Agent Loop
     void *raw_event_data; // Reserved for additional metadata
 } pi_ai_event_t;
 
