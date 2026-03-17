@@ -2,12 +2,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <time.h>
 
-// Tool: Add
+// Tool: Add with delay to test parallelism
 pi_agent_tool_result_t tool_add(const char *id, const cJSON *args, void *user_data) {
     cJSON *a = cJSON_GetObjectItem(args, "a");
     cJSON *b = cJSON_GetObjectItem(args, "b");
     double res = (a ? a->valuedouble : 0) + (b ? b->valuedouble : 0);
+
+    printf("[Tool Add] Working on %f + %f...\n", (a?a->valuedouble:0), (b?b->valuedouble:0));
+    sleep(2); // Simulate long task
 
     pi_agent_tool_result_t result = {0};
     result.content = cJSON_CreateObject();
@@ -20,6 +25,9 @@ pi_agent_tool_result_t tool_multiply(const char *id, const cJSON *args, void *us
     cJSON *a = cJSON_GetObjectItem(args, "a");
     cJSON *b = cJSON_GetObjectItem(args, "b");
     double res = (a ? a->valuedouble : 0) * (b ? b->valuedouble : 0);
+
+    printf("[Tool Multiply] Working on %f * %f...\n", (a?a->valuedouble:0), (b?b->valuedouble:0));
+    sleep(2);
 
     pi_agent_tool_result_t result = {0};
     result.content = cJSON_CreateObject();
@@ -52,17 +60,20 @@ int main() {
     };
 
     pi_agent_t *agent = pi_agent_create(&options);
+    agent->tool_execution_mode = PI_AGENT_TOOL_EXECUTION_PARALLEL;
 
-    // Register tools
     const char *math_schema = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\"},\"b\":{\"type\":\"number\"}},\"required\":[\"a\",\"b\"]}";
     pi_agent_register_tool(agent, "add", "Add two numbers", math_schema, tool_add);
     pi_agent_register_tool(agent, "multiply", "Multiply two numbers", math_schema, tool_multiply);
 
-    printf("Agent ready. Prompt: 'What is (123 + 456) * 78?'\n");
-    pi_agent_run(agent, "What is (123 + 456) * 78?", agent_event_callback);
+    printf("Agent ready (Parallel Mode). Prompt: 'Give me the results of 1+1, 2+2, and 3+3.'\n");
+    time_t start = time(NULL);
+    pi_agent_run(agent, "Give me the results of 1+1, 2+2, and 3+3 simultaneously.", agent_event_callback);
+    time_t end = time(NULL);
+
+    printf("\nTotal time taken: %ld seconds\n", (long)(end - start));
+    printf("(If parallel, it should be ~2 seconds. If sequential, it should be ~6 seconds.)\n");
 
     pi_agent_free(agent);
-    printf("\nDone.\n");
-
     return 0;
 }

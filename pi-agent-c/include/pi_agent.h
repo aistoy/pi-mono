@@ -30,11 +30,17 @@ typedef struct {
     pi_agent_tool_proc_t proc;
 } pi_agent_tool_t;
 
+typedef enum {
+    PI_AGENT_TOOL_EXECUTION_SEQUENTIAL,
+    PI_AGENT_TOOL_EXECUTION_PARALLEL
+} pi_agent_tool_execution_mode_t;
+
 typedef struct {
     pi_ai_context_t context;
     pi_ai_openai_options_t options;
     pi_agent_tool_t *agent_tools;
     size_t agent_tool_count;
+    pi_agent_tool_execution_mode_t tool_execution_mode;
     int max_iterations;
     void *user_data;
 } pi_agent_t;

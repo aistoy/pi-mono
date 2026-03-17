@@ -7,6 +7,7 @@ pi_agent_t* pi_agent_create(const pi_ai_openai_options_t *options) {
     if (agent) {
         agent->options = *options;
         agent->max_iterations = 10;
+        agent->tool_execution_mode = PI_AGENT_TOOL_EXECUTION_PARALLEL;
     }
     return agent;
 }

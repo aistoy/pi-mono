@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 
 typedef struct {
     char *id;
@@ -20,31 +21,39 @@ typedef struct {
     tool_call_queue_t *queue;
 } agent_callback_ctx_t;
 
+typedef struct {
+    pi_agent_tool_t *atool;
+    const char *id;
+    const char *args_json;
+    void *agent_user_data;
+    pi_agent_tool_result_t result;
+} tool_thread_arg_t;
+
+static void* tool_thread_func(void *arg) {
+    tool_thread_arg_t *targ = (tool_thread_arg_t *)arg;
+    cJSON *args = cJSON_Parse(targ->args_json);
+    targ->result = targ->atool->proc(targ->id, args, targ->agent_user_data);
+    cJSON_Delete(args);
+    return NULL;
+}
+
 static void agent_internal_callback(pi_ai_event_t *event, void *user_data) {
     agent_callback_ctx_t *ctx = (agent_callback_ctx_t *)user_data;
 
     if (event->type == PI_AI_EVENT_TOOLCALL_END) {
-        // Collect tool call
         ctx->queue->calls = realloc(ctx->queue->calls, sizeof(pending_tool_call_t) * (ctx->queue->count + 1));
         pending_tool_call_t *call = &ctx->queue->calls[ctx->queue->count];
-        // We need to extract ID and Name from the event or raw data.
-        // For simplicity in this implementation, we assume we need to parse the full content or have it in raw data.
-        // Let's assume the event->full_content is the JSON of arguments, but we need ID and Name too.
-        // In pi_ai_openai.c we have it. Let's make sure it's accessible.
-
         call->id = strdup(event->tool_call_id ? event->tool_call_id : "unknown");
         call->name = strdup(event->tool_call_name ? event->tool_call_name : "unknown");
         call->args = strdup(event->full_content);
         ctx->queue->count++;
     }
 
-    // Forward to user callback
     if (ctx->original_callback) {
         ctx->original_callback(event, ctx->user_data);
     }
 }
 
-// Helper to find agent tool
 static pi_agent_tool_t* find_agent_tool(pi_agent_t *agent, const char *name) {
     for (size_t i = 0; i < agent->agent_tool_count; i++) {
         if (strcmp(agent->agent_tools[i].info.name, name) == 0) {
@@ -52,6 +61,24 @@ static pi_agent_tool_t* find_agent_tool(pi_agent_t *agent, const char *name) {
         }
     }
     return NULL;
+}
+
+static void append_tool_result(pi_agent_t *agent, const char *id, const char *name, pi_agent_tool_result_t result) {
+    agent->context.messages = realloc(agent->context.messages, sizeof(pi_ai_message_t) * (agent->context.message_count + 1));
+    pi_ai_message_t *tm = &agent->context.messages[agent->context.message_count];
+    memset(tm, 0, sizeof(pi_ai_message_t));
+    tm->role = strdup("toolResult");
+    tm->tool_call_id = strdup(id);
+    tm->tool_name = strdup(name);
+    tm->is_error = result.is_error;
+
+    char *res_str = cJSON_PrintUnformatted(result.content);
+    pi_ai_message_add_text(tm, res_str);
+    free(res_str);
+    cJSON_Delete(result.content);
+    if (result.details) cJSON_Delete(result.details);
+
+    agent->context.message_count++;
 }
 
 int pi_agent_run(pi_agent_t *agent, const char *user_prompt, pi_ai_callback_t callback) {
@@ -71,38 +98,56 @@ int pi_agent_run(pi_agent_t *agent, const char *user_prompt, pi_ai_callback_t ca
         int res = pi_ai_openai_stream(&agent->options, &agent->context, agent_internal_callback, &ctx);
         if (res != 0) return res;
 
-        if (queue.count == 0) break; // Done
+        if (queue.count == 0) break;
 
-        // Execute tools
-        for (size_t i = 0; i < queue.count; i++) {
-            pi_agent_tool_t *atool = find_agent_tool(agent, queue.calls[i].name);
-            pi_agent_tool_result_t result;
-            if (atool) {
-                cJSON *args = cJSON_Parse(queue.calls[i].args);
-                result = atool->proc(queue.calls[i].id, args, agent->user_data);
-                cJSON_Delete(args);
-            } else {
-                result.is_error = true;
-                result.content = cJSON_CreateString("Tool not found");
+        if (agent->tool_execution_mode == PI_AGENT_TOOL_EXECUTION_PARALLEL) {
+            pthread_t *threads = malloc(sizeof(pthread_t) * queue.count);
+            tool_thread_arg_t *args = malloc(sizeof(tool_thread_arg_t) * queue.count);
+
+            for (size_t i = 0; i < queue.count; i++) {
+                args[i].atool = find_agent_tool(agent, queue.calls[i].name);
+                args[i].id = queue.calls[i].id;
+                args[i].args_json = queue.calls[i].args;
+                args[i].agent_user_data = agent->user_data;
+
+                if (args[i].atool) {
+                    pthread_create(&threads[i], NULL, tool_thread_func, &args[i]);
+                }
             }
 
-            // Append Tool Result to context
-            agent->context.messages = realloc(agent->context.messages, sizeof(pi_ai_message_t) * (agent->context.message_count + 1));
-            pi_ai_message_t *tm = &agent->context.messages[agent->context.message_count];
-            memset(tm, 0, sizeof(pi_ai_message_t));
-            tm->role = strdup("toolResult");
-            tm->tool_call_id = strdup(queue.calls[i].id);
-            tm->tool_name = strdup(queue.calls[i].name);
-            tm->is_error = result.is_error;
+            for (size_t i = 0; i < queue.count; i++) {
+                if (args[i].atool) {
+                    pthread_join(threads[i], NULL);
+                } else {
+                    args[i].result.is_error = true;
+                    args[i].result.content = cJSON_CreateString("Tool not found");
+                    args[i].result.details = NULL;
+                }
+                append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, args[i].result);
+            }
 
-            char *res_str = cJSON_PrintUnformatted(result.content);
-            pi_ai_message_add_text(tm, res_str);
-            free(res_str);
-            cJSON_Delete(result.content);
-            if (result.details) cJSON_Delete(result.details);
+            free(threads);
+            free(args);
+        } else {
+            // Sequential
+            for (size_t i = 0; i < queue.count; i++) {
+                pi_agent_tool_t *atool = find_agent_tool(agent, queue.calls[i].name);
+                pi_agent_tool_result_t result;
+                if (atool) {
+                    cJSON *args = cJSON_Parse(queue.calls[i].args);
+                    result = atool->proc(queue.calls[i].id, args, agent->user_data);
+                    cJSON_Delete(args);
+                } else {
+                    result.is_error = true;
+                    result.content = cJSON_CreateString("Tool not found");
+                    result.details = NULL;
+                }
+                append_tool_result(agent, queue.calls[i].id, queue.calls[i].name, result);
+            }
+        }
 
-            agent->context.message_count++;
-
+        // Cleanup queue
+        for (size_t i = 0; i < queue.count; i++) {
             free(queue.calls[i].id);
             free(queue.calls[i].name);
             free(queue.calls[i].args);
